@@ -638,19 +638,21 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
     # ── Step 9: Root password + bulletproof SSH setup ────────────────
     log.info(f"[{vps_id}] Setting root password and configuring SSH...")
 
-    # Set root password
+    # Set root password two ways to be sure
     ct.exec_run(f"bash -c \"echo 'root:{root_pass}' | chpasswd\"", tty=False)
+    ct.exec_run(f"bash -c \"usermod -p $(openssl passwd -6 '{root_pass}') root 2>/dev/null || true\"", tty=False)
 
     # Create required directories
     ct.exec_run("mkdir -p /run/sshd /var/run/sshd /etc/ssh", tty=False)
 
     # Generate SSH host keys
-    r = ct.exec_run("ssh-keygen -A", tty=False)
+    r = ct.exec_run("ssh-keygen -A 2>&1", tty=False)
     log.info(f"[{vps_id}] ssh-keygen -A exit={r.exit_code}")
 
-    # Write a fresh minimal sshd_config — avoids ALL sed/config corruption issues
-    # UsePrivilegeSeparation no is CRITICAL for Docker containers
-    sshd_config = (
+    # Write fresh minimal sshd_config directly via shell (more reliable than put_archive)
+    # UsePrivilegeSeparation no + UsePAM no are CRITICAL for Docker containers
+    sshd_cfg_cmd = (
+        "cat > /etc/ssh/sshd_config << 'SSHEOF'\n"
         "Port 22\n"
         "Protocol 2\n"
         "HostKey /etc/ssh/ssh_host_rsa_key\n"
@@ -660,40 +662,39 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
         "PermitRootLogin yes\n"
         "PasswordAuthentication yes\n"
         "ChallengeResponseAuthentication no\n"
+        "KbdInteractiveAuthentication no\n"
         "UsePAM no\n"
         "X11Forwarding no\n"
         "PrintMotd yes\n"
         "AcceptEnv LANG LC_*\n"
         "Subsystem sftp /usr/lib/openssh/sftp-server\n"
+        "SSHEOF"
     )
-    write_file(ct, "/etc/ssh/sshd_config", sshd_config)
+    r = ct.exec_run(f"bash -c \"{sshd_cfg_cmd}\"", tty=False)
+    log.info(f"[{vps_id}] sshd_config write exit={r.exit_code}")
 
-    # Test config validity before starting
-    r = ct.exec_run("sshd -t", tty=False)
-    log.info(f"[{vps_id}] sshd config test exit={r.exit_code} "
-             f"output={r.output.decode(errors='ignore').strip() if r.output else ''}")
+    # Test config
+    r = ct.exec_run("sshd -t 2>&1", tty=False)
+    out = r.output.decode(errors="ignore").strip() if r.output else ""
+    log.info(f"[{vps_id}] sshd -t exit={r.exit_code} | {out}")
 
-    # Start sshd — try systemctl first, fall back to direct binary
-    r = ct.exec_run(
-        "bash -c '"
-        "systemctl restart ssh 2>/dev/null || "
-        "systemctl restart sshd 2>/dev/null || "
-        "service ssh restart 2>/dev/null || "
-        "/usr/sbin/sshd"
-        "'",
-        tty=False,
-    )
-    log.info(f"[{vps_id}] sshd start exit={r.exit_code}")
+    # Kill any existing sshd, then start fresh directly (bypass systemctl)
+    ct.exec_run("bash -c 'pkill -9 sshd 2>/dev/null; sleep 1'", tty=False)
+    r = ct.exec_run("bash -c '/usr/sbin/sshd -f /etc/ssh/sshd_config 2>&1'", tty=False)
+    out = r.output.decode(errors="ignore").strip() if r.output else ""
+    log.info(f"[{vps_id}] sshd start exit={r.exit_code} | {out}")
 
-    # Verify sshd is listening on port 22
-    time.sleep(2)
-    r2 = ct.exec_run("bash -c 'ss -tlnp | grep :22 || netstat -tlnp | grep :22'", tty=False)
+    # Wait and verify
+    time.sleep(3)
+    r2 = ct.exec_run("bash -c 'ss -tlnp | grep :22'", tty=False)
     sshd_up = r2.output and b":22" in r2.output
-    log.info(f"[{vps_id}] sshd listening on :22 = {sshd_up}")
+    log.info(f"[{vps_id}] sshd listening :22 = {sshd_up}")
     if not sshd_up:
-        ct.exec_run("/usr/sbin/sshd", tty=False)
-        time.sleep(1)
-        log.info(f"[{vps_id}] Forced /usr/sbin/sshd")
+        # retry once more
+        ct.exec_run("bash -c '/usr/sbin/sshd -f /etc/ssh/sshd_config'", tty=False)
+        time.sleep(2)
+        r3 = ct.exec_run("bash -c 'ss -tlnp | grep :22'", tty=False)
+        log.info(f"[{vps_id}] sshd retry listening = {r3.output and b':22' in r3.output}")
 
     log.info(f"[{vps_id}] ✅ Provision complete — direct SSH ready on port {host_port}")
     return ct, ""
