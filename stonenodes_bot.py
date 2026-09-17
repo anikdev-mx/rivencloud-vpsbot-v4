@@ -587,13 +587,33 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
 
     # ── Step 5: apt update + install packages ───────────────────────
     log.info(f"[{vps_id}] Running apt update...")
-    ct.exec_run("bash -c 'apt-get update -qq'", tty=False)
-    log.info(f"[{vps_id}] Installing openssh-server, tmate, neofetch, tools...")
+    ct.exec_run("bash -c 'apt-get update -qq 2>&1'", tty=False)
+    log.info(f"[{vps_id}] Installing openssh-server, tools...")
     ct.exec_run(
         "bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "
-        "openssh-server tmate neofetch curl wget sudo procps net-tools iproute2 htop'",
+        "openssh-server neofetch curl wget sudo procps net-tools iproute2 htop'",
         tty=False,
     )
+
+    # ── Step 6: VERIFY openssh-server installed — retry if not ──────
+    for attempt in range(1, 4):
+        r = ct.exec_run("bash -c 'which sshd || ls /usr/sbin/sshd 2>/dev/null'", tty=False)
+        sshd_exists = r.output and b"sshd" in r.output
+        log.info(f"[{vps_id}] sshd binary check attempt {attempt}: exists={sshd_exists}")
+        if sshd_exists:
+            break
+        log.warning(f"[{vps_id}] openssh-server not found, retrying install (attempt {attempt})...")
+        ct.exec_run("bash -c 'apt-get update -qq 2>&1'", tty=False)
+        ct.exec_run(
+            "bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server 2>&1'",
+            tty=False,
+        )
+    else:
+        log.error(f"[{vps_id}] FAILED to install openssh-server after 3 attempts!")
+        raise RuntimeError(
+            "openssh-server could not be installed in the container after 3 attempts. "
+            "Check the host's internet connection and Docker apt cache."
+        )
 
     # ── Step 7: Fake /proc/meminfo and /proc/cpuinfo ─────────────────
     ct.exec_run("mkdir -p /etc/stonenodes", tty=False)
@@ -638,9 +658,8 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
     # ── Step 9: Root password + bulletproof SSH setup ────────────────
     log.info(f"[{vps_id}] Setting root password and configuring SSH...")
 
-    # Set root password two ways to be sure
+    # Set root password
     ct.exec_run(f"bash -c \"echo 'root:{root_pass}' | chpasswd\"", tty=False)
-    ct.exec_run(f"bash -c \"usermod -p $(openssl passwd -6 '{root_pass}') root 2>/dev/null || true\"", tty=False)
 
     # Create required directories
     ct.exec_run("mkdir -p /run/sshd /var/run/sshd /etc/ssh", tty=False)
@@ -649,10 +668,9 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
     r = ct.exec_run("ssh-keygen -A 2>&1", tty=False)
     log.info(f"[{vps_id}] ssh-keygen -A exit={r.exit_code}")
 
-    # Write fresh minimal sshd_config directly via shell (more reliable than put_archive)
-    # UsePrivilegeSeparation no + UsePAM no are CRITICAL for Docker containers
-    sshd_cfg_cmd = (
-        "cat > /etc/ssh/sshd_config << 'SSHEOF'\n"
+    # Write fresh minimal sshd_config via write_file
+    # UsePrivilegeSeparation no + UsePAM no are CRITICAL for Docker
+    sshd_config = (
         "Port 22\n"
         "Protocol 2\n"
         "HostKey /etc/ssh/ssh_host_rsa_key\n"
@@ -668,29 +686,26 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
         "PrintMotd yes\n"
         "AcceptEnv LANG LC_*\n"
         "Subsystem sftp /usr/lib/openssh/sftp-server\n"
-        "SSHEOF"
     )
-    r = ct.exec_run(f"bash -c \"{sshd_cfg_cmd}\"", tty=False)
-    log.info(f"[{vps_id}] sshd_config write exit={r.exit_code}")
+    write_file(ct, "/etc/ssh/sshd_config", sshd_config)
 
     # Test config
     r = ct.exec_run("sshd -t 2>&1", tty=False)
     out = r.output.decode(errors="ignore").strip() if r.output else ""
     log.info(f"[{vps_id}] sshd -t exit={r.exit_code} | {out}")
 
-    # Kill any existing sshd, then start fresh directly (bypass systemctl)
+    # Kill old sshd, start fresh directly — bypass systemctl for reliability
     ct.exec_run("bash -c 'pkill -9 sshd 2>/dev/null; sleep 1'", tty=False)
     r = ct.exec_run("bash -c '/usr/sbin/sshd -f /etc/ssh/sshd_config 2>&1'", tty=False)
     out = r.output.decode(errors="ignore").strip() if r.output else ""
     log.info(f"[{vps_id}] sshd start exit={r.exit_code} | {out}")
 
-    # Wait and verify
+    # Verify sshd is listening
     time.sleep(3)
     r2 = ct.exec_run("bash -c 'ss -tlnp | grep :22'", tty=False)
     sshd_up = r2.output and b":22" in r2.output
     log.info(f"[{vps_id}] sshd listening :22 = {sshd_up}")
     if not sshd_up:
-        # retry once more
         ct.exec_run("bash -c '/usr/sbin/sshd -f /etc/ssh/sshd_config'", tty=False)
         time.sleep(2)
         r3 = ct.exec_run("bash -c 'ss -tlnp | grep :22'", tty=False)
