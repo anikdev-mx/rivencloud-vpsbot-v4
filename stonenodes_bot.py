@@ -1,6 +1,6 @@
 """
 ╔═══════════════════════════════════════════════════════╗
-║           StoneNodes VPS Manager Bot                  ║
+║           LashariHost VPS Manager Bot                  ║
 ║  Server: 180GB RAM | 94 Core CPU | Docker + systemd  ║
 ║  • Docker-in-Docker VPS containers                   ║
 ║  • Full systemctl support                            ║
@@ -53,11 +53,11 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("stonenodes.log"),
+        logging.FileHandler("lasharihost.log"),
         logging.StreamHandler(),
     ],
 )
-log = logging.getLogger("StoneNodes")
+log = logging.getLogger("LashariHost")
 
 # ─────────────────────────────────────────────────────
 # COLORS
@@ -67,7 +67,7 @@ GREEN  = 0x57F287
 RED    = 0xED4245
 YELLOW = 0xFEE75C
 DARK   = 0x2F3136
-FOOTER = "Powered by StoneNodes"
+FOOTER = "Powered by LashariHost"
 
 # ─────────────────────────────────────────────────────
 # OS + CPU
@@ -86,7 +86,7 @@ CPU_MAP = {
     "xeon":   "Intel(R) Xeon(R) Platinum 8480+ @ 3.80GHz",
 }
 
-DB_FILE = "stonenodes.db"
+DB_FILE = "lasharihost.db"
 
 # ─────────────────────────────────────────────────────
 # DATABASE
@@ -141,6 +141,14 @@ def init_db():
                 disk_gb      INTEGER NOT NULL,
                 valid_days   INTEGER DEFAULT 0,
                 created_by   INTEGER,
+                created_at   TEXT    DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS port_forwards (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                vps_id       TEXT    NOT NULL,
+                host_port    INTEGER NOT NULL UNIQUE,
+                container_port INTEGER NOT NULL,
+                protocol     TEXT    DEFAULT 'tcp',
                 created_at   TEXT    DEFAULT (datetime('now'))
             );
         """)
@@ -212,6 +220,94 @@ def open_port_firewall(port: int):
         log.info(f"iptables: opened port {port}")
     except Exception as e:
         log.warning(f"iptables open failed (non-fatal): {e}")
+
+
+# ─────────────────────────────────────────────────────
+# PORT FORWARDING HELPERS
+# ─────────────────────────────────────────────────────
+PORT_FWD_MAX = 10   # max port forwards per VPS
+
+def _get_container_ip(container_id: str) -> str:
+    """Get the internal Docker IP of a running container."""
+    try:
+        ct = get_docker().containers.get(container_id)
+        ct.reload()
+        nets = ct.attrs["NetworkSettings"]["Networks"]
+        for net in nets.values():
+            ip = net.get("IPAddress", "")
+            if ip:
+                return ip
+    except Exception:
+        pass
+    return ""
+
+def add_port_forward(vps_id: str, container_id: str, host_port: int, container_port: int) -> str:
+    """Add iptables DNAT rule to forward host_port → container:container_port."""
+    with get_db() as c:
+        count = c.execute(
+            "SELECT COUNT(*) AS n FROM port_forwards WHERE vps_id=?", (vps_id,)
+        ).fetchone()["n"]
+        if count >= PORT_FWD_MAX:
+            raise RuntimeError(f"Maximum {PORT_FWD_MAX} port forwards per VPS reached.")
+        used = c.execute(
+            "SELECT 1 FROM port_forwards WHERE host_port=?", (host_port,)
+        ).fetchone()
+        if used:
+            raise RuntimeError(f"Host port {host_port} is already in use by another forward.")
+
+    container_ip = _get_container_ip(container_id)
+    if not container_ip:
+        raise RuntimeError("Could not determine container IP. Is the VPS running?")
+
+    # Open host firewall port
+    subprocess.run(["iptables", "-I", "INPUT", "-p", "tcp",
+                    "--dport", str(host_port), "-j", "ACCEPT"],
+                   capture_output=True, check=False)
+    # DNAT: external host_port → container_ip:container_port
+    subprocess.run(["iptables", "-t", "nat", "-A", "PREROUTING",
+                    "-p", "tcp", "--dport", str(host_port),
+                    "-j", "DNAT", "--to-destination", f"{container_ip}:{container_port}"],
+                   capture_output=True, check=False)
+    # Allow forwarded traffic
+    subprocess.run(["iptables", "-A", "FORWARD", "-p", "tcp",
+                    "-d", container_ip, "--dport", str(container_port), "-j", "ACCEPT"],
+                   capture_output=True, check=False)
+
+    with get_db() as c:
+        c.execute(
+            "INSERT INTO port_forwards (vps_id, host_port, container_port) VALUES (?,?,?)",
+            (vps_id, host_port, container_port),
+        )
+    log.info(f"[{vps_id}] Port forward added: {host_port} → {container_ip}:{container_port}")
+    return container_ip
+
+def remove_port_forward(vps_id: str, container_id: str, host_port: int):
+    """Remove iptables DNAT rule and DB record."""
+    with get_db() as c:
+        row = c.execute(
+            "SELECT * FROM port_forwards WHERE vps_id=? AND host_port=?", (vps_id, host_port)
+        ).fetchone()
+    if not row:
+        raise RuntimeError(f"No port forward found for host port {host_port} on {vps_id}.")
+
+    container_ip = _get_container_ip(container_id)
+    container_port = row["container_port"]
+
+    if container_ip:
+        subprocess.run(["iptables", "-t", "nat", "-D", "PREROUTING",
+                        "-p", "tcp", "--dport", str(host_port),
+                        "-j", "DNAT", "--to-destination", f"{container_ip}:{container_port}"],
+                       capture_output=True, check=False)
+        subprocess.run(["iptables", "-D", "FORWARD", "-p", "tcp",
+                        "-d", container_ip, "--dport", str(container_port), "-j", "ACCEPT"],
+                       capture_output=True, check=False)
+    subprocess.run(["iptables", "-D", "INPUT", "-p", "tcp",
+                    "--dport", str(host_port), "-j", "ACCEPT"],
+                   capture_output=True, check=False)
+
+    with get_db() as c:
+        c.execute("DELETE FROM port_forwards WHERE vps_id=? AND host_port=?", (vps_id, host_port))
+    log.info(f"[{vps_id}] Port forward removed: host_port={host_port}")
 
 
 
@@ -362,16 +458,16 @@ def next_id() -> str:
     dk_max = 0
     try:
         for ct in get_docker().containers.list(
-            all=True, filters={"label": "managed-by=stonenodes"}
+            all=True, filters={"label": "managed-by=lasharihost"}
         ):
-            if ct.name.startswith("stonenodes-vps-"):
+            if ct.name.startswith("lasharihost-vps-"):
                 try:
                     dk_max = max(dk_max, int(ct.name.split("-")[-1]))
                 except ValueError:
                     pass
     except Exception:
         pass
-    return f"stonenodes-vps-{max(db_num, dk_max + 1):04d}"
+    return f"lasharihost-vps-{max(db_num, dk_max + 1):04d}"
 
 def gb(b): return round(b / 1024**3, 2)
 
@@ -485,7 +581,7 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
 
     Steps:
       1. Pull jrei/systemd image
-      2. Create container on stonenodes-net (unique IP per VPS)
+      2. Create container on lasharihost-net (unique IP per VPS)
       3. Wait for systemd to boot
       4. apt install openssh-server (no update — faster)
       5. Fake /proc/meminfo and /proc/cpuinfo
@@ -575,7 +671,7 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
         command="/sbin/init",
         host_config=host_cfg,
         ports=[22],
-        labels={"managed-by": "stonenodes", "vps-id": vps_id},
+        labels={"managed-by": "lasharihost", "vps-id": vps_id},
     )
     client.api.start(ct_data["Id"])
     ct = client.containers.get(ct_data["Id"])
@@ -616,21 +712,21 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
         )
 
     # ── Step 7: Fake /proc/meminfo and /proc/cpuinfo ─────────────────
-    ct.exec_run("mkdir -p /etc/stonenodes", tty=False)
+    ct.exec_run("mkdir -p /etc/lasharihost", tty=False)
 
-    write_file(ct, "/etc/stonenodes/meminfo", fake_meminfo(ram_mb))
-    r = ct.exec_run("mount --bind /etc/stonenodes/meminfo /proc/meminfo", tty=False)
+    write_file(ct, "/etc/lasharihost/meminfo", fake_meminfo(ram_mb))
+    r = ct.exec_run("mount --bind /etc/lasharihost/meminfo /proc/meminfo", tty=False)
     log.info(f"[{vps_id}] meminfo bind mount: exit={r.exit_code}")
 
-    write_file(ct, "/etc/stonenodes/cpuinfo", fake_cpuinfo(cpu_cores, cpu_name))
-    r = ct.exec_run("mount --bind /etc/stonenodes/cpuinfo /proc/cpuinfo", tty=False)
+    write_file(ct, "/etc/lasharihost/cpuinfo", fake_cpuinfo(cpu_cores, cpu_name))
+    r = ct.exec_run("mount --bind /etc/lasharihost/cpuinfo /proc/cpuinfo", tty=False)
     log.info(f"[{vps_id}] cpuinfo bind mount: exit={r.exit_code}")
 
     # Re-apply mounts on container restart
     write_file(ct, "/etc/rc.local",
         "#!/bin/bash\n"
-        "mount --bind /etc/stonenodes/meminfo /proc/meminfo 2>/dev/null\n"
-        "mount --bind /etc/stonenodes/cpuinfo /proc/cpuinfo 2>/dev/null\n"
+        "mount --bind /etc/lasharihost/meminfo /proc/meminfo 2>/dev/null\n"
+        "mount --bind /etc/lasharihost/cpuinfo /proc/cpuinfo 2>/dev/null\n"
         "exit 0\n"
     )
     ct.exec_run("chmod +x /etc/rc.local", tty=False)
@@ -645,7 +741,7 @@ def provision(vps_id, image, os_label, ram_mb, cpu_cores, disk_gb, cpu_name,
     write_file(ct, "/etc/motd",
         f"\n"
         f"  ╔══════════════════════════════════╗\n"
-        f"  ║        🐉  StoneNodes VPS           ║\n"
+        f"  ║        🐉  LashariHost VPS           ║\n"
         f"  ╠══════════════════════════════════╣\n"
         f"  ║  VPS ID : {vps_id:<24}║\n"
         f"  ║  RAM    : {str(ram_mb)+' MB':<24}║\n"
@@ -989,7 +1085,7 @@ async def do_create(ix, user, ram, cpu, disk, os_key, cpu_key, days=0, node_id=N
 intents         = discord.Intents.default()
 intents.members = True
 
-class StoneNodesBot(commands.Bot):
+class LashariHostBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents)
 
@@ -1005,10 +1101,10 @@ class StoneNodesBot(commands.Bot):
         if not update_status.is_running():
             update_status.start()
 
-bot = StoneNodesBot()
+bot = LashariHostBot()
 
 # ─────────────────────────────────────────────────────
-# LIVE STATUS TASK — "StoneNodes | {n} VPS Running"
+# LIVE STATUS TASK — "LashariHost | {n} VPS Running"
 # ─────────────────────────────────────────────────────
 @tasks.loop(minutes=2)
 async def update_status():
@@ -1019,7 +1115,7 @@ async def update_status():
             ).fetchone()["n"]
         await bot.change_presence(activity=discord.Activity(
             type=discord.ActivityType.watching,
-            name=f"StoneNodes | {count} VPS Running"))
+            name=f"LashariHost | {count} VPS Running"))
     except Exception as e:
         log.warning(f"Status update failed: {e}")
 
@@ -1064,7 +1160,7 @@ async def _before(): await bot.wait_until_ready()
 # ══════════════════════════════════════════════
 
 @bot.tree.command(name="start", description="Start your VPS.")
-@app_commands.describe(vps_id="e.g. stonenodes-vps-0001")
+@app_commands.describe(vps_id="e.g. lasharihost-vps-0001")
 async def cmd_start(ix: discord.Interaction, vps_id: str):
     await ix.response.defer(ephemeral=True)
     vps_id = vps_id.lower()
@@ -1087,7 +1183,7 @@ async def cmd_start(ix: discord.Interaction, vps_id: str):
 
 
 @bot.tree.command(name="stop", description="Stop your VPS.")
-@app_commands.describe(vps_id="e.g. stonenodes-vps-0001")
+@app_commands.describe(vps_id="e.g. lasharihost-vps-0001")
 async def cmd_stop(ix: discord.Interaction, vps_id: str):
     await ix.response.defer(ephemeral=True)
     vps_id = vps_id.lower()
@@ -1104,7 +1200,7 @@ async def cmd_stop(ix: discord.Interaction, vps_id: str):
 
 
 @bot.tree.command(name="restart", description="Restart your VPS.")
-@app_commands.describe(vps_id="e.g. stonenodes-vps-0001")
+@app_commands.describe(vps_id="e.g. lasharihost-vps-0001")
 async def cmd_restart(ix: discord.Interaction, vps_id: str):
     await ix.response.defer(ephemeral=True)
     vps_id = vps_id.lower()
@@ -1124,7 +1220,7 @@ async def cmd_restart(ix: discord.Interaction, vps_id: str):
 
 
 @bot.tree.command(name="reinstall", description="Reinstall your VPS (same specs, data wiped).")
-@app_commands.describe(vps_id="e.g. stonenodes-vps-0001")
+@app_commands.describe(vps_id="e.g. lasharihost-vps-0001")
 async def cmd_reinstall(ix: discord.Interaction, vps_id: str):
     await ix.response.defer(ephemeral=True)
     vps_id = vps_id.lower()
@@ -1167,8 +1263,108 @@ async def cmd_reinstall(ix: discord.Interaction, vps_id: str):
         await ix.followup.send(embed=em("❌ Error", str(e), RED))
 
 
+@bot.tree.command(name="port-add", description="Add a port forward for your VPS (max 10).")
+@app_commands.describe(
+    vps_id="Your VPS ID, e.g. lasharihost-vps-0001",
+    host_port="Port on the public server (e.g. 30001)",
+    container_port="Port inside your VPS to forward to (e.g. 80, 3000, 8080)",
+)
+async def cmd_port_add(ix: discord.Interaction, vps_id: str, host_port: int, container_port: int):
+    await ix.response.defer(ephemeral=True)
+    vps_id = vps_id.lower()
+    if not owns(ix.user.id, vps_id):
+        return await ix.followup.send(embed=em("❌ Access Denied", "That VPS doesn't belong to you.", RED))
+    with get_db() as c:
+        row = c.execute("SELECT * FROM vps WHERE vps_id=?", (vps_id,)).fetchone()
+    if not row:
+        return await ix.followup.send(embed=em("❌ Not Found", f"**{vps_id}** not found.", RED))
+    if row["status"] != "running":
+        return await ix.followup.send(embed=em("⚠️ Not Running", f"Start your VPS first: `/start {vps_id}`", YELLOW))
+    if not (1 <= host_port <= 65535) or not (1 <= container_port <= 65535):
+        return await ix.followup.send(embed=em("❌ Invalid Port", "Ports must be between 1 and 65535.", RED))
+    if host_port in range(20000, 30000):
+        return await ix.followup.send(embed=em("❌ Reserved Range", "Ports 20000-29999 are reserved for VPS SSH. Pick another port.", RED))
+    try:
+        container_ip = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: add_port_forward(vps_id, row["container_id"], host_port, container_port)
+        )
+        server_ip = row["ssh_ip"] or SERVER_IP
+        await ix.followup.send(embed=em(
+            "✅ Port Forward Added",
+            f"Traffic to **`{server_ip}:{host_port}`** will now be forwarded to port **`{container_port}`** inside your VPS.",
+            GREEN,
+            fields=[
+                ("VPS ID",          f"`{vps_id}`",          True),
+                ("Host Port",       f"`{host_port}`",        True),
+                ("Container Port",  f"`{container_port}`",   True),
+                ("Connect Example", f"`{server_ip}:{host_port}`", False),
+            ],
+        ))
+    except Exception as e:
+        await ix.followup.send(embed=em("❌ Error", str(e), RED))
+
+
+@bot.tree.command(name="port-list", description="List all port forwards for your VPS.")
+@app_commands.describe(vps_id="Your VPS ID, e.g. lasharihost-vps-0001")
+async def cmd_port_list(ix: discord.Interaction, vps_id: str):
+    await ix.response.defer(ephemeral=True)
+    vps_id = vps_id.lower()
+    if not owns(ix.user.id, vps_id) and not is_admin(ix):
+        return await ix.followup.send(embed=em("❌ Access Denied", "That VPS doesn't belong to you.", RED))
+    with get_db() as c:
+        rows = c.execute(
+            "SELECT * FROM port_forwards WHERE vps_id=? ORDER BY host_port", (vps_id,)
+        ).fetchall()
+        vps = c.execute("SELECT ssh_ip FROM vps WHERE vps_id=?", (vps_id,)).fetchone()
+    if not rows:
+        return await ix.followup.send(embed=em(
+            "📋 No Port Forwards",
+            f"**{vps_id}** has no port forwards yet.\nUse `/port-add {vps_id} <host_port> <container_port>` to add one.",
+            BLUE,
+        ))
+    server_ip = (vps["ssh_ip"] if vps else None) or SERVER_IP
+    fields = []
+    for r in rows:
+        fields.append((
+            f"Host :{r['host_port']}",
+            f"→ VPS :{r['container_port']} | Connect: `{server_ip}:{r['host_port']}`",
+            False,
+        ))
+    await ix.followup.send(embed=em(
+        f"📋 Port Forwards — {vps_id} ({len(rows)}/{PORT_FWD_MAX})",
+        "", BLUE, fields=fields,
+    ))
+
+
+@bot.tree.command(name="port-remove", description="Remove a port forward from your VPS.")
+@app_commands.describe(
+    vps_id="Your VPS ID, e.g. lasharihost-vps-0001",
+    host_port="The host port to remove (from /port-list)",
+)
+async def cmd_port_remove(ix: discord.Interaction, vps_id: str, host_port: int):
+    await ix.response.defer(ephemeral=True)
+    vps_id = vps_id.lower()
+    if not owns(ix.user.id, vps_id) and not is_admin(ix):
+        return await ix.followup.send(embed=em("❌ Access Denied", "That VPS doesn't belong to you.", RED))
+    with get_db() as c:
+        row = c.execute("SELECT container_id FROM vps WHERE vps_id=?", (vps_id,)).fetchone()
+    if not row:
+        return await ix.followup.send(embed=em("❌ Not Found", f"**{vps_id}** not found.", RED))
+    try:
+        await asyncio.get_running_loop().run_in_executor(
+            None, lambda: remove_port_forward(vps_id, row["container_id"], host_port)
+        )
+        await ix.followup.send(embed=em(
+            "🗑 Port Forward Removed",
+            f"Host port **`{host_port}`** removed from **{vps_id}**.",
+            YELLOW,
+        ))
+    except Exception as e:
+        await ix.followup.send(embed=em("❌ Error", str(e), RED))
+
+
 @bot.tree.command(name="regen-ssh", description="Get a fresh tmate SSH session.")
-@app_commands.describe(vps_id="e.g. stonenodes-vps-0001")
+@app_commands.describe(vps_id="e.g. lasharihost-vps-0001")
 async def cmd_regen(ix: discord.Interaction, vps_id: str):
     await ix.response.defer(ephemeral=True)
     vps_id = vps_id.lower()
@@ -1192,7 +1388,7 @@ async def cmd_regen(ix: discord.Interaction, vps_id: str):
 
 
 @bot.tree.command(name="vps-performance", description="Live stats for your VPS.")
-@app_commands.describe(vps_id="e.g. stonenodes-vps-0001")
+@app_commands.describe(vps_id="e.g. lasharihost-vps-0001")
 async def cmd_perf(ix: discord.Interaction, vps_id: str):
     await ix.response.defer(ephemeral=True)
     vps_id = vps_id.lower()
@@ -1285,7 +1481,7 @@ async def cmd_commands(ix: discord.Interaction):
         ("`/ptero-status`",                                      "🦅  Pterodactyl status",     False),
     ])
     r = em("📖 Reference", "", DARK, fields=[
-        ("VPS ID",      "`stonenodes-vps-0001`, `stonenodes-vps-0002` ...",                 False),
+        ("VPS ID",      "`lasharihost-vps-0001`, `lasharihost-vps-0002` ...",                 False),
         ("OS",          "`ubuntu20` `ubuntu22` `ubuntu24` `debian11` `debian12`",        False),
         ("CPU",         "`ryzen9` → AMD Ryzen 9 9950X\n`xeon` → Intel Xeon Platinum 8480+", False),
         ("SSH Access",  "tmate SSH only — sent to DM, never public",                     False),
@@ -1786,7 +1982,7 @@ async def cmd_ptero(ix: discord.Interaction):
 # 1-CLICK DEPLOY
 # ══════════════════════════════════════════════
 
-class DeployModal(discord.ui.Modal, title="🐉 StoneNodes — Deploy VPS"):
+class DeployModal(discord.ui.Modal, title="🐉 LashariHost — Deploy VPS"):
     ram  = discord.ui.TextInput(label="RAM (MB)",  placeholder="512",  default="512", min_length=1, max_length=7)
     cpu  = discord.ui.TextInput(label="CPU Cores", placeholder="1",    default="1",   min_length=1, max_length=5)
     disk = discord.ui.TextInput(label="Disk (GB)", placeholder="10",   default="10",  min_length=1, max_length=5)
@@ -1957,5 +2153,5 @@ if __name__ == "__main__":
     else:
         log.info(f"Pterodactyl enabled — {PTERO_URL}")
     init_db()
-    log.info("Starting StoneNodes VPS Manager...")
+    log.info("Starting LashariHost VPS Manager...")
     bot.run(DISCORD_TOKEN, log_handler=None)
