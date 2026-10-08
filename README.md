@@ -101,7 +101,7 @@ if you're on AWS, GCP, Azure, Contabo, Hetzner, etc.
 ### 7. Run the bot
 
 ```bash
-python3 rivencloud_bot.py
+python3 rivencloud.py
 ```
 
 You should see:
