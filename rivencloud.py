@@ -1,6 +1,6 @@
 """
 ╔═══════════════════════════════════════════════════════╗
-║           LashariHost VPS Manager Bot                  ║
+║           ANIK-DEV VPS Manager Bot                  ║
 ║  Server: 180GB RAM | 94 Core CPU | Docker + systemd  ║
 ║  • Docker-in-Docker VPS containers                   ║
 ║  • Full systemctl support                            ║
