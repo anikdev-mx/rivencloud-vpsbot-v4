@@ -53,11 +53,11 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("lasharihost.log"),
+        logging.FileHandler("rivencloud.log"),
         logging.StreamHandler(),
     ],
 )
-log = logging.getLogger("LashariHost")
+log = logging.getLogger("rivencloud")
 
 # ─────────────────────────────────────────────────────
 # COLORS
@@ -67,7 +67,7 @@ GREEN  = 0x57F287
 RED    = 0xED4245
 YELLOW = 0xFEE75C
 DARK   = 0x2F3136
-FOOTER = "Powered by LashariHost"
+FOOTER = "Powered by rivencloud"
 
 # ─────────────────────────────────────────────────────
 # OS + CPU
@@ -86,7 +86,7 @@ CPU_MAP = {
     "xeon":   "Intel(R) Xeon(R) Platinum 8480+ @ 3.80GHz",
 }
 
-DB_FILE = "lasharihost.db"
+DB_FILE = "rivencloud.db"
 
 # ─────────────────────────────────────────────────────
 # DATABASE
